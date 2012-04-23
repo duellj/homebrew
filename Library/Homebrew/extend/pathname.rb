@@ -8,8 +8,16 @@ class Pathname
     sources.each do |src|
       case src
       when Array
+        if src.empty?
+          opoo "tried to install empty array to #{self}"
+          return []
+        end
         src.each {|s| results << install_p(s) }
       when Hash
+        if src.empty?
+          opoo "tried to install empty hash to #{self}"
+          return []
+        end
         src.each {|s, new_basename| results << install_p(s, new_basename) }
       else
         results << install_p(src)
@@ -88,6 +96,15 @@ class Pathname
     raise "Will not overwrite #{to_s}" if exist? and not ARGV.force?
     dirname.mkpath
     File.open(self, 'w') {|f| f.write content }
+  end
+
+  # NOTE always overwrites
+  def atomic_write content
+    require 'tempfile'
+    tf = Tempfile.new(self.basename.to_s)
+    tf.write(content)
+    tf.close
+    FileUtils.mv tf.path, self.to_s
   end
 
   def cp dst
@@ -273,14 +290,26 @@ class Pathname
 
     self.dirname.mkpath
     Dir.chdir self.dirname do
-      # TODO use Ruby function so we get exceptions
-      # NOTE Ruby functions may work, but I had a lot of problems
-      rv = system 'ln', '-sf', src.relative_path_from(self.dirname), self.basename
-      unless rv and $? == 0
-        raise <<-EOS.undent
-          Could not create symlink #{to_s}.
-          Check that you have permissions on #{self.dirname}
-          EOS
+      # NOTE only system ln -s will create RELATIVE symlinks
+      quiet_system 'ln', '-s', src.relative_path_from(self.dirname), self.basename
+      if not $?.success?
+        if self.exist?
+          raise <<-EOS.undent
+            Could not symlink file: #{src.expand_path}
+            Target #{self} already exists. You may need to delete it.
+            EOS
+        elsif !dirname.writable?
+          raise <<-EOS.undent
+            Could not symlink file: #{src.expand_path}
+            #{dirname} is not writable. You should change its permissions.
+            EOS
+        else
+          raise <<-EOS.undent
+            Could not symlink file: #{src.expand_path}
+            #{self} may already exist.
+            #{dirname} may not be writable.
+            EOS
+        end
       end
     end
   end
@@ -313,6 +342,36 @@ class Pathname
     end
     system '/usr/bin/install-info', '--delete', '--quiet', self.to_s, (self.dirname+'dir').to_s
   end
+
+  def all_formula pwd = self
+    children.map{ |child| child.relative_path_from(pwd) }.each do |pn|
+      yield pn if pn.to_s =~ /.rb$/
+    end
+    children.each do |child|
+      child.all_formula(pwd) do |pn|
+        yield pn
+      end if child.directory?
+    end
+  end
+
+  def find_formula
+    # remove special casing once tap is established and alt removed
+    if self == HOMEBREW_LIBRARY/"Taps/adamv-alt"
+      all_formula do |file|
+        yield file
+      end
+      return
+    end
+
+    [self/:Formula, self/:HomebrewFormula, self].each do |d|
+      if d.exist?
+        d.children.map{ |child| child.relative_path_from(self) }.each do |pn|
+          yield pn if pn.to_s =~ /.rb$/
+        end
+        break
+      end
+    end
+  end
 end
 
 # sets $n and $d so you can observe creation of stuff
@@ -334,7 +393,6 @@ module ObserverPathnameExtension
   end
   def make_relative_symlink src
     super
-    puts "ln #{to_s}" if ARGV.verbose?
     $n+=1
   end
   def install_info
